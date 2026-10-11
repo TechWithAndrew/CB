@@ -1,0 +1,27 @@
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    environment:
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+    volumes:
+      - ../config.json:/app/config.json:ro
+      - ../data:/app/data
+    secrets:
+      - discord_token
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+secrets:
+  discord_token:
+    file: ${DISCORD_SECRET_FILE:?Set DISCORD_SECRET_FILE to your private token file outside the repository}

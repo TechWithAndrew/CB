@@ -1,0 +1,64 @@
+{
+  "guild_id": null,
+  "staff_role_ids": [],
+  "welcome_channel_id": null,
+  "audit_channel_id": null,
+  "announcement_channel_ids": [],
+  "ping_role_ids": [],
+  "require_verified_for_features": true,
+  "branding": {
+    "name": "State Zero Games",
+    "color": 8150268,
+    "footer": "State Zero Games • Build. Play. Connect.",
+    "welcome_title": "Welcome to State Zero Games",
+    "welcome_message": "Welcome {mention}!\n\nYou've entered State Zero Games — a home for players, creators, and our next big ideas.\n\nRead the rules and verify below to unlock the community.\nMember #{member_count}",
+    "welcome_image": null,
+    "verification_title": "Access the State Zero community",
+    "verification_message": "Read the server rules, then select Verify.\n\nComplete the short image challenge to receive the community role. If you need help or an accessible alternative, contact our moderators.",
+    "ticket_title": "State Zero Games | Support",
+    "ticket_message": "Need a hand? Choose a category below.\n\nYour private ticket will be visible to you and the support team. Server administrators can also access tickets."
+  },
+  "verification": {
+    "role_id": null,
+    "min_account_age_hours": 24,
+    "challenge_seconds": 180,
+    "max_attempts": 3,
+    "cooldown_seconds": 60,
+    "raid_join_count": 10,
+    "raid_window_seconds": 60
+  },
+  "role_menus": [],
+  "ticket_categories": [
+    {
+      "key": "player-support",
+      "label": "Player Support",
+      "description": "Help with our games and your player experience",
+      "parent_id": null,
+      "support_role_ids": [],
+      "opening_message": "Welcome to Player Support!\n\nTell us which game you're playing, your platform, and what you need help with. Never share passwords or payment details."
+    },
+    {
+      "key": "bug-report",
+      "label": "Bug Report",
+      "description": "Report a problem with steps, screenshots, and details",
+      "parent_id": null,
+      "support_role_ids": [],
+      "opening_message": "Thanks for helping improve our games!\n\n**Game / version:**\n**Platform:**\n**What happened:**\n**Steps to reproduce:**\n**What you expected:**\n\nAttach a screenshot or clip if helpful."
+    },
+    {
+      "key": "other",
+      "label": "Other",
+      "description": "Anything else you need to discuss with the team",
+      "parent_id": null,
+      "support_role_ids": [],
+      "opening_message": "Welcome! Let us know what you'd like to discuss with the State Zero Games team."
+    }
+  ],
+  "limits": {
+    "max_open_tickets": 100,
+    "max_tickets_per_hour": 60,
+    "ticket_reopen_seconds": 600,
+    "welcome_messages_per_minute": 20,
+    "verification_challenges_per_minute": 30
+  }
+}
