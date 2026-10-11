@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import unittest
+from contextlib import chdir
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -200,6 +201,40 @@ class SecurityTests(unittest.TestCase):
         formatter = RedactedFormatter("private-token")
         record = logging.LogRecord("test", 20, "", 0, "error private-token", (), None)
         self.assertNotIn("private-token", formatter.format(record))
+
+    def test_default_token_file_requires_private_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with chdir(directory), patch.dict(os.environ, {}, clear=True):
+                Path("secrets").mkdir(mode=0o700)
+                path = Path("secrets/discord_token")
+                path.write_text("  test-secret\n")
+                path.chmod(0o600)
+                self.assertEqual(read_token(), "test-secret")
+                path.chmod(0o644)
+                with self.assertRaises(UserError):
+                    read_token()
+                path.unlink()
+                with self.assertRaises(UserError):
+                    read_token()
+
+    def test_explicit_token_sources_override_default_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with chdir(directory), patch.dict(
+                os.environ, {"DISCORD_TOKEN": "environment-test-secret"}, clear=True
+            ):
+                Path("secrets").mkdir(mode=0o700)
+                path = Path("secrets/discord_token")
+                path.write_text("default-test-secret")
+                path.chmod(0o644)
+                self.assertEqual(read_token(), "environment-test-secret")
+                explicit = Path("explicit.token")
+                explicit.write_text("explicit-test-secret")
+                explicit.chmod(0o600)
+                os.environ["DISCORD_TOKEN_FILE"] = str(explicit)
+                self.assertEqual(read_token(), "explicit-test-secret")
+                explicit.chmod(0o644)
+                with self.assertRaises(UserError):
+                    read_token()
 
     def test_cooldown_blocks_and_is_bounded(self):
         cooldowns = Cooldowns(capacity=2)

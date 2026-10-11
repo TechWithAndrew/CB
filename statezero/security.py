@@ -17,16 +17,21 @@ class UserError(Exception):
 
 def read_token() -> str:
     path = os.environ.get("DISCORD_TOKEN_FILE")
+    environment_token = os.environ.get("DISCORD_TOKEN", "").strip()
+    if not path and not environment_token:
+        default_file = Path("secrets") / "discord_token"
+        if default_file.exists():
+            path = str(default_file)
     if path:
         file = Path(path)
         if stat.S_IMODE(file.stat().st_mode) & 0o077:
             raise UserError("Token file must be private (chmod 600).")
         token = file.read_text().strip()
     else:
-        token = os.environ.get("DISCORD_TOKEN", "").strip()
+        token = environment_token
     if not token:
         raise UserError(
-            "Set DISCORD_TOKEN through your hosting secret store, or DISCORD_TOKEN_FILE to a private secret file."
+            "Set DISCORD_TOKEN through your hosting secret store, set DISCORD_TOKEN_FILE to a private secret file, or create secrets/discord_token with permissions 600."
         )
     return token
 

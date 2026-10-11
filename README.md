@@ -41,7 +41,7 @@ A configurable Discord bot for the State Zero Games studio community, built with
    .venv/bin/python -m unittest discover -s tests -v
    ```
 
-8. Store the bot token in your hosting provider's secret manager as `DISCORD_TOKEN`, or mount a private file and set `DISCORD_TOKEN_FILE` to its path. The bot does not load `.env` files. Never paste the token into Discord, chat, JSON configuration, source code, or a command-line argument. Run:
+8. Store the bot token in your hosting provider's secret manager as `DISCORD_TOKEN`, or mount a private file and set `DISCORD_TOKEN_FILE` to its path. For a Pelican egg without custom environment variables, the bot also accepts `secrets/discord_token` with permissions `600` when neither environment source is configured; see the Pelican guide for access and backup controls. The bot does not load `.env` files. Never paste the token into Discord, chat, JSON configuration, source code, or a command-line argument. Run:
 
    ```bash
    .venv/bin/python -m statezero

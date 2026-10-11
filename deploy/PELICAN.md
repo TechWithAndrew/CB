@@ -33,7 +33,7 @@ Pelican already runs the egg in a container. The `Dockerfile` and Compose templa
    | `DISCORD_TOKEN` | Actual token, only when using restricted environment storage instead of a file. |
    | `BOT_MESSAGE_CONTENT` | `true` only if complete ticket transcripts are needed and Message Content Intent is enabled in the Developer Portal; otherwise omit or use `false`. |
 
-   Set only the selected token source. `DISCORD_TOKEN_FILE` takes precedence if both are present. The bot does not automatically read `.env` files.
+   Set only the selected token source. `DISCORD_TOKEN_FILE` takes precedence if both are present. A generic Python egg may expose only Git-related variables and no Discord token variable. In that case, use the private-file option below. The bot does not automatically read `.env` files.
 7. Before the live startup, run these commands in the container, or temporarily use them as startup commands one at a time:
 
    ```bash
@@ -46,6 +46,17 @@ Pelican already runs the egg in a container. The `Dockerfile` and Compose templa
 8. Start once, inspect the console for a successful Discord connection, and use `/bot-status` in your private test server. A panel status of **Running** alone does not prove the Discord connection works. Enable Server Members Intent in the Developer Portal and complete TESTING.md before public rollout.
 
 ## Token access and panel permissions
+
+### When the egg has no Discord token variable
+
+The Git token field is for repository authentication, not Discord. With neither `DISCORD_TOKEN_FILE` nor a nonempty `DISCORD_TOKEN` set, the bot reads **`secrets/discord_token`** relative to its working directory. For the usual egg working directory `/home/container`:
+
+1. Stop the bot and create a `secrets` folder in the panel's Files area.
+2. Inside it, create a file named `discord_token` with only the bot token as its contents. Create it directly on the host; do not bundle it in a source upload or share its contents.
+3. Set the file's Unix permissions to **`600`** and, where possible, the folder's to `700`. Use an SFTP client with permission controls, a supported panel permission editor, or ask the provider to do this. A node administrator can run `chmod 600 /home/container/secrets/discord_token` as the runtime user or with appropriate privileges. The bot refuses group/world-readable token files; do not bypass this check.
+4. Keep `main.py` as the startup script. No extra egg variable is needed. Make sure startup uses `/home/container` as its working directory, as it does for the default relative configuration and data paths.
+
+`secrets/` is excluded from Git and Docker build contexts. This file is still accessible to privileged panel/node users and may be included in panel backups. Restrict file/SFTP/backup permissions and protect backups. The following external-mount option provides better separation when your provider supports it.
 
 Prefer a provider-managed **read-only secret mount outside `/home/container`** when available. The file must be readable by the egg's actual runtime user and have mode `0600`; do not assume the Docker template's UID 10001 applies to your Pelican egg. Your node administrator must arrange the mount and ownership. Do not create a path such as `/run/secrets/discord_token` in settings unless a readable file is actually mounted there.
 
