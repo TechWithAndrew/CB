@@ -1,3 +1,2 @@
-discord.py==2.7.1
-Pillow==12.3.0
-pydantic==2.14.0
+# Generic Python eggs install this file automatically. Use the verified full lock.
+-r requirements.lock

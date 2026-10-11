@@ -4,13 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "state-zero-community"
-version = "0.1.0"
+dynamic = ["version"]
 description = "State Zero Games Discord community bot"
 requires-python = ">=3.12"
-dynamic = ["dependencies"]
+dependencies = ["discord.py==2.7.1", "Pillow==12.3.0", "pydantic==2.14.0"]
 
 [tool.setuptools.dynamic]
-dependencies = {file = ["requirements.txt"]}
+version = {attr = "statezero.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["statezero*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "ASYNC"]

@@ -1,16 +1,21 @@
 import asyncio
 import io
 import logging
+import math
+import secrets
 import time
 from collections import deque
 
 import discord
 from discord import app_commands
 
+from . import __version__
 from .captcha import render
 from .config import RoleMenu, Settings
+from .operations import Operations, guarded, percentile, together, write_health
+from .recovery import TicketRecovery, private_ticket, ticket_topic
 from .security import Challenges, Cooldowns, RateWindow, UserError, image_url, safe_role
-from .storage import Store
+from .storage import AsyncStore
 
 log = logging.getLogger("statezero")
 
@@ -46,7 +51,7 @@ class Modal(discord.ui.Modal):
 
 
 class StudioBot(discord.Client):
-    def __init__(self, config: Settings, store: Store, *, message_content=False):
+    def __init__(self, config: Settings, store: AsyncStore, *, message_content=False):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.members = True
@@ -58,6 +63,18 @@ class StudioBot(discord.Client):
             chunk_guilds_at_startup=False,
         )
         self.config, self.store = config, store
+        self.operations = Operations(
+            config.limits, config.operations.action_timeout_seconds
+        )
+        self.tickets_ready = False
+        self.verification_locked = True
+        self.background_tasks = []
+        self.background_failures = 0
+        self.recovery_problems = []
+        self.recovery_last_success = None
+        self.loop_lags = deque(maxlen=120)
+        self.recovery = TicketRecovery(self)
+        self.audit_queue = asyncio.Queue(maxsize=100)
         self.tree = app_commands.CommandTree(self)
         self.cooldowns = Cooldowns()
         self.challenges = Challenges(
@@ -95,10 +112,24 @@ class StudioBot(discord.Client):
             raise UserError(
                 "This action is only available in the configured State Zero Games server."
             )
-        member = await interaction.guild.fetch_member(interaction.user.id)
+        try:
+            async with asyncio.timeout(2):
+                if staff:
+                    member, roles = await together(
+                        interaction.guild.fetch_member(interaction.user.id),
+                        interaction.guild.fetch_roles(),
+                    )
+                    authorized = await self.staff_access(member, roles=roles)
+                else:
+                    member = await interaction.guild.fetch_member(interaction.user.id)
+                    authorized = False
+        except TimeoutError:
+            raise UserError(
+                "Permission checks are busy. Please try again shortly."
+            ) from None
         if member.bot:
             raise UserError("This feature is for community members.")
-        if staff and not self.is_staff(member):
+        if staff and not authorized:
             raise UserError(
                 "This action requires Manage Server or a configured staff role."
             )
@@ -108,30 +139,88 @@ class StudioBot(discord.Client):
                 raise UserError("Complete verification before using this feature.")
         return member
 
-    def is_staff(self, member: discord.Member):
-        return member.guild_permissions.manage_guild or any(
-            not r.is_default() and r.id in self.config.staff_role_ids
-            for r in member.roles
+    async def role_map(self, guild):
+        try:
+            async with asyncio.timeout(2):
+                return {role.id: role for role in await guild.fetch_roles()}
+        except TimeoutError:
+            raise UserError(
+                "Role safety checks are busy. Please try again shortly."
+            ) from None
+
+    async def staff_access(self, member, *, roles=None):
+        if any(
+            not role.is_default() and role.id in self.config.staff_role_ids
+            for role in member.roles
+        ):
+            return True
+        async with asyncio.timeout(2):
+            if member.id == getattr(member.guild, "owner_id", None):
+                fresh_guild = await self.fetch_guild(member.guild.id)
+                if fresh_guild.owner_id == member.id:
+                    return True
+            fresh = (
+                {role.id: role for role in roles}
+                if roles is not None
+                else await self.role_map(member.guild)
+            )
+            ids = {member.guild.id, *(role.id for role in member.roles)}
+            return any(
+                role.permissions.manage_guild or role.permissions.administrator
+                for role_id in ids
+                if (role := fresh.get(role_id))
+            )
+
+    def audit_channel_safe(self, channel, *, fresh_roles=None):
+        if (
+            not isinstance(channel, discord.TextChannel)
+            or channel.guild.id != self.config.guild_id
+        ):
+            return False
+        guild = channel.guild
+        allowed = {guild.me.id, *self.config.staff_role_ids}
+        for target, overwrite in channel.overwrites.items():
+            if overwrite.view_channel is True and target.id not in allowed:
+                role = (
+                    fresh_roles.get(target.id)
+                    if fresh_roles is not None
+                    else guild.get_role(target.id)
+                )
+                if not role or not (
+                    role.permissions.manage_guild or role.permissions.administrator
+                ):
+                    return False
+        everyone = next(
+            (
+                value
+                for target, value in channel.overwrites.items()
+                if target.id == guild.id
+            ),
+            None,
         )
+        return everyone is not None and everyone.view_channel is False
 
     async def audit(self, actor: int, action: str, **details):
-        self.store.audit(actor, action, **details)
+        await self.store.audit(actor, action, **details)
         channel = self.get_channel(self.config.audit_channel_id or 0)
-        if (
-            isinstance(channel, discord.TextChannel)
-            and channel.guild.id == self.config.guild_id
-        ):
+        if self.audit_channel_safe(channel):
             # IDs and outcomes only. Never log announcement bodies, CAPTCHA answers, or tokens.
-            summary = "\n".join(f"{key}: {value}" for key, value in details.items())
             try:
-                await channel.send(
-                    embed=self.embed(action, f"Actor: {actor}\n{summary}"),
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.HTTPException:
-                log.warning("Audit channel unavailable; event retained in SQLite")
+                self.audit_queue.put_nowait((actor, action, details))
+            except asyncio.QueueFull:
+                self.operations.counts["audit_notifications_dropped"] += 1
 
     async def setup_hook(self):
+        await self.store.health()
+        previous_guild = await self.store.setting("guild_id")
+        if previous_guild and previous_guild != str(self.config.guild_id):
+            raise UserError(
+                "This database belongs to another Discord server. Use the correct config or a separate data directory."
+            )
+        await self.store.set_setting("guild_id", str(self.config.guild_id))
+        self.verification_locked = (
+            await self.store.setting("verification_locked") == "1"
+        )
         self.add_view(VerificationPanel(self))
         self.add_view(TicketControls(self))
         if self.config.ticket_categories:
@@ -141,6 +230,25 @@ class StudioBot(discord.Client):
         guild = discord.Object(id=self.config.guild_id)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
+        self.background_tasks = [
+            asyncio.create_task(self.monitor(), name="statezero-health"),
+            asyncio.create_task(self.recovery_loop(), name="statezero-recovery"),
+            asyncio.create_task(self.audit_loop(), name="statezero-audit"),
+        ]
+        for task in self.background_tasks:
+            task.add_done_callback(self.background_finished)
+
+    def background_finished(self, task):
+        if task.cancelled() or self.is_closed():
+            return
+        error = task.exception()
+        self.background_failures += 1
+        self.tickets_ready = False
+        log.error(
+            "Background task %s stopped (%s)",
+            task.get_name(),
+            type(error).__name__ if error else "unexpected completion",
+        )
 
     async def on_ready(self):
         log.info(
@@ -150,12 +258,168 @@ class StudioBot(discord.Client):
         if not guild:
             log.error("Bot is not a member of the configured guild")
             return
+        for other in self.guilds:
+            if other.id != self.config.guild_id:
+                await other.leave()
         problems = self.configuration_problems(guild)
         for problem in problems:
             log.warning("Configuration: %s", problem)
+        try:
+            await self.recovery.run(guild)
+        except Exception as error:
+            self.tickets_ready = False
+            log.error("Startup ticket recovery failed (%s)", type(error).__name__)
+
+    async def on_guild_join(self, guild):
+        if guild.id != self.config.guild_id:
+            await guild.leave()
+
+    async def close(self):
+        for task in self.background_tasks:
+            task.cancel()
+        if self.background_tasks:
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
+        self.background_tasks = []
+        await super().close()
+
+    async def set_verification_lock(self, locked):
+        if locked:
+            self.verification_locked = True
+        await self.store.set_setting("verification_locked", "1" if locked else "0")
+        self.verification_locked = locked
+
+    async def audit_loop(self):
+        while not self.is_closed():
+            actor, action, details = await self.audit_queue.get()
+            batch = [(actor, action, details)]
+            for _ in range(7):
+                try:
+                    batch.append(self.audit_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            channel = self.get_channel(self.config.audit_channel_id or 0)
+            try:
+                if self.audit_channel_safe(channel):
+                    async with asyncio.timeout(2):
+                        channel, roles = await together(
+                            self.fetch_channel(channel.id), self.role_map(channel.guild)
+                        )
+                    if not self.audit_channel_safe(channel, fresh_roles=roles):
+                        raise UserError("Audit channel access is unsafe.")
+                    summaries = [
+                        f"**{action}** | actor {actor}\n"
+                        + "; ".join(
+                            f"{key}: {value}" for key, value in details.items()
+                        )[:350]
+                        for actor, action, details in batch
+                    ]
+                    await channel.send(
+                        embed=self.embed(
+                            "Recent bot actions", "\n\n".join(summaries)[:4000]
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    self.operations.counts["audit_notifications_dropped"] += len(batch)
+            except (discord.HTTPException, UserError, TimeoutError):
+                self.operations.counts["audit_notifications_dropped"] += len(batch)
+                log.warning("Audit notification unavailable; events retained in SQLite")
+            finally:
+                for _ in batch:
+                    self.audit_queue.task_done()
+            await asyncio.sleep(5)
+
+    async def recovery_loop(self):
+        while not self.is_closed():
+            await asyncio.sleep(self.config.operations.recovery_interval_seconds)
+            guild = self.get_guild(self.config.guild_id)
+            if self.is_ready() and guild:
+                try:
+                    await self.recovery.run(guild)
+                except Exception as error:
+                    self.tickets_ready = False
+                    log.error(
+                        "Periodic ticket recovery failed (%s)", type(error).__name__
+                    )
+
+    async def monitor(self):
+        interval = self.config.operations.health_interval_seconds
+        expected = time.monotonic()
+        while not self.is_closed():
+            self.loop_lags.append(max(0, time.monotonic() - expected))
+            guild = self.get_guild(self.config.guild_id)
+            problems = (
+                self.configuration_problems(guild)
+                if guild
+                else ["Configured guild unavailable"]
+            )
+            try:
+                storage = await self.store.health()
+                latency = self.latency
+                payload = {
+                    "version": __version__,
+                    "timestamp": time.time(),
+                    "ready": self.is_ready(),
+                    "verification_paused": self.verification_locked,
+                    "healthy": self.is_ready()
+                    and self.tickets_ready
+                    and self.background_failures == 0
+                    and not problems
+                    and not self.recovery_problems
+                    and storage["pending_requests"] == 0,
+                    "configuration_problem_count": len(problems),
+                    "recovery_problem_count": len(self.recovery_problems),
+                    "recovery_last_success": self.recovery_last_success,
+                    "background_task_failures": self.background_failures,
+                    "gateway_latency_seconds": round(latency, 4)
+                    if math.isfinite(latency)
+                    else None,
+                    "event_loop_lag_seconds_p95": percentile(self.loop_lags),
+                    "database_seconds_p95": percentile(self.store.latencies),
+                    "database_pending": self.store.pending,
+                    "audit_notifications_pending": self.audit_queue.qsize(),
+                    **storage,
+                    **self.operations.snapshot(),
+                }
+                await asyncio.to_thread(
+                    write_health, self.store.path.parent / "health.json", payload
+                )
+                log.info(
+                    "Operational health: ready=%s healthy=%s active=%s pending_tickets=%s lag_p95=%s",
+                    payload["ready"],
+                    payload["healthy"],
+                    payload["active_actions"],
+                    payload["pending_requests"],
+                    payload["event_loop_lag_seconds_p95"],
+                )
+            except Exception as error:
+                log.error("Health monitoring failed (%s)", type(error).__name__)
+            expected = time.monotonic() + interval
+            await asyncio.sleep(interval)
 
     def configuration_problems(self, guild: discord.Guild):
         problems = []
+        baseline = guild.default_role.permissions
+        if (
+            baseline.administrator
+            or baseline.manage_guild
+            or baseline.manage_roles
+            or baseline.manage_channels
+            or baseline.ban_members
+            or baseline.kick_members
+            or baseline.moderate_members
+        ):
+            problems.append(
+                "Remove administrative/moderation permissions from @everyone."
+            )
+        if guild.me and guild.me.guild_permissions.administrator:
+            problems.append("Remove Administrator permission from the bot.")
+        if self.config.audit_channel_id and not self.audit_channel_safe(
+            guild.get_channel(self.config.audit_channel_id)
+        ):
+            problems.append(
+                "Audit channel must deny @everyone and allow only bot/configured staff/Manage Server roles."
+            )
         if not self.config.verification.role_id:
             problems.append("Set verification.role_id before posting verification")
         else:
@@ -214,13 +478,13 @@ class StudioBot(discord.Client):
             self.joins.popleft()
         if (
             len(self.joins) >= self.config.verification.raid_join_count
-            and self.store.setting("verification_locked") != "1"
+            and not self.verification_locked
         ):
-            self.store.set_setting("verification_locked", "1")
+            await self.set_verification_lock(True)
             await self.audit(
                 0, "Verification paused: join spike", count=len(self.joins)
             )
-        if self.store.setting("verification_locked") == "1":
+        if self.verification_locked:
             return
         channel = member.guild.get_channel(self.config.welcome_channel_id or 0)
         if isinstance(channel, discord.TextChannel):
@@ -249,8 +513,10 @@ class StudioBot(discord.Client):
                 )
 
     async def on_guild_channel_delete(self, channel):
-        if channel.guild.id == self.config.guild_id and self.store.ticket(channel.id):
-            self.store.close_ticket(channel.id)
+        if channel.guild.id == self.config.guild_id and await self.store.ticket(
+            channel.id
+        ):
+            await self.store.close_ticket(channel.id)
 
     async def begin_verification(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -260,8 +526,12 @@ class StudioBot(discord.Client):
         self.verification_rate.take()
         member = await self.member(interaction)
         async with self.lock(member.id):
-            self.verification_eligible(member)
-            role = safe_role(member.guild, self.config.verification.role_id or 0)
+            await self.verification_eligible(member)
+            role = safe_role(
+                member.guild,
+                self.config.verification.role_id or 0,
+                fresh_roles=await self.role_map(member.guild),
+            )
             if role in member.roles:
                 raise UserError("You are already verified.")
             code = self.challenges.create(member.id)
@@ -277,8 +547,11 @@ class StudioBot(discord.Client):
                 embed=embed, file=file, view=AnswerView(self, member.id), ephemeral=True
             )
 
-    def verification_eligible(self, member):
-        if self.store.setting("verification_locked") == "1":
+    async def verification_eligible(self, member):
+        if (
+            self.verification_locked
+            or await self.store.setting("verification_locked") == "1"
+        ):
             raise UserError(
                 "Verification is temporarily paused for server safety. Please contact a moderator."
             )
@@ -294,6 +567,10 @@ class StudioBot(discord.Client):
         if channel.guild.id != self.config.guild_id:
             raise UserError("Choose a channel in this server.")
         allowed = self.config.announcement_channel_ids
+        if not allowed and not self.config.allow_any_announcement_channel:
+            raise UserError(
+                "Configure announcement_channel_ids before sending announcements."
+            )
         if allowed and channel.id not in allowed:
             raise UserError("This channel is not in announcement_channel_ids.")
         permissions = channel.permissions_for(channel.guild.me)
@@ -329,6 +606,7 @@ class StudioBot(discord.Client):
             description="Compose, preview, and publish an embed announcement",
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def announce(
             interaction: discord.Interaction,
             channel: discord.TextChannel,
@@ -351,6 +629,7 @@ class StudioBot(discord.Client):
             name="verify", description="Complete the community verification challenge"
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def verify(interaction: discord.Interaction):
             await self.begin_verification(interaction)
 
@@ -359,12 +638,17 @@ class StudioBot(discord.Client):
             description="Post the persistent verification panel",
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def verification_panel(
             interaction: discord.Interaction, channel: discord.TextChannel
         ):
             await self.member(interaction, staff=True)
-            safe_role(interaction.guild, self.config.verification.role_id or 0)
             await interaction.response.defer(ephemeral=True, thinking=True)
+            safe_role(
+                interaction.guild,
+                self.config.verification.role_id or 0,
+                fresh_roles=await self.role_map(interaction.guild),
+            )
             brand = self.config.branding
             await channel.send(
                 embed=self.embed(brand.verification_title, brand.verification_message),
@@ -379,11 +663,13 @@ class StudioBot(discord.Client):
             description="Pause or resume new verification during a raid",
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def verification_lock(interaction: discord.Interaction, locked: bool):
             await self.member(interaction, staff=True)
-            self.store.set_setting("verification_locked", "1" if locked else "0")
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await self.set_verification_lock(locked)
             self.joins.clear()
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Verification paused." if locked else "Verification resumed.",
                 ephemeral=True,
             )
@@ -394,6 +680,7 @@ class StudioBot(discord.Client):
             description="Post a configured persistent role selection menu",
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def role_panel(
             interaction: discord.Interaction, channel: discord.TextChannel, menu: str
         ):
@@ -403,9 +690,10 @@ class StudioBot(discord.Client):
                 raise UserError(
                     "Unknown menu key. Configure role_menus in config.json."
                 )
-            for option in config.options:
-                safe_role(interaction.guild, option.role_id)
             await interaction.response.defer(ephemeral=True, thinking=True)
+            fresh = await self.role_map(interaction.guild)
+            for option in config.options:
+                safe_role(interaction.guild, option.role_id, fresh_roles=fresh)
             await channel.send(
                 embed=self.embed(config.title, config.description),
                 view=RolePanel(self, config),
@@ -425,6 +713,7 @@ class StudioBot(discord.Client):
             description="Post the configured private ticket category menu",
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def ticket_panel(
             interaction: discord.Interaction, channel: discord.TextChannel
         ):
@@ -445,6 +734,7 @@ class StudioBot(discord.Client):
             name="ticket-close", description="Close and archive this private ticket"
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def ticket_close(interaction: discord.Interaction):
             await request_close(self, interaction)
 
@@ -453,54 +743,65 @@ class StudioBot(discord.Client):
             description="Export this ticket as a private text file",
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def transcript(interaction: discord.Interaction):
-            await ticket_member(self, interaction)
-            self.cooldowns.take(("transcript", interaction.channel_id), 30)
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            lines = [
-                "State Zero Games ticket transcript",
-                "Newest 1,000 messages (text and attachment URLs only).",
-                f"Message Content Intent enabled: {self.intents.message_content}. Content may be omitted by Discord when disabled.",
-            ]
-            async for message in interaction.channel.history(limit=1000):
-                content = message.content
-                for embed in message.embeds:
-                    content += (
-                        f"\n[Embed] {embed.title or ''}\n{embed.description or ''}"
-                    )
-                for attachment in message.attachments:
-                    content += f"\n[Attachment] {attachment.url}"
-                lines.append(
-                    f"{message.created_at.isoformat()} | {message.author.id} | {content}"
-                )
-            data = "\n\n".join(lines).encode("utf-8")
-            if len(data) > min(interaction.guild.filesize_limit, 7_000_000):
-                raise UserError(
-                    "Transcript exceeds the upload limit. Contact a moderator to export a smaller range."
-                )
-            await interaction.followup.send(
-                file=discord.File(
-                    io.BytesIO(data), filename=f"ticket-{interaction.channel_id}.txt"
-                ),
-                ephemeral=True,
-            )
-            await self.audit(
-                interaction.user.id,
-                "Transcript exported",
-                channel=interaction.channel_id,
-            )
+            await export_transcript(self, interaction)
 
         @self.tree.command(
             name="bot-status", description="Show configuration issues and safety status"
         )
         @app_commands.guild_only()
+        @guarded(self)
         async def status(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True, thinking=True)
             await self.member(interaction, staff=True)
             problems = self.configuration_problems(interaction.guild)
-            text = f"Verification paused: {self.store.setting('verification_locked', '0') == '1'}\nRole menus: {len(self.config.role_menus)}\nTicket categories: {len(self.config.ticket_categories)}\n"
-            text += "\n".join(problems) or "Configuration checks passed."
-            await interaction.response.send_message(
+            text = f"Verification paused: {await self.store.setting('verification_locked', '0') == '1'}\nRole menus: {len(self.config.role_menus)}\nTicket categories: {len(self.config.ticket_categories)}\n"
+            snapshot = self.operations.snapshot()
+            text += f"Tickets accepting requests: {self.tickets_ready}\nActive actions: {snapshot['active_actions']}\nRecent action p95: {snapshot['action_seconds_p95']} seconds\nRecovery items: {len(self.recovery_problems)}\n"
+            text += (
+                "\n".join(problems + self.recovery_problems)
+                or "Configuration checks passed."
+            )
+            await interaction.followup.send(
                 embed=self.embed("Bot status", text[:4000]), ephemeral=True
+            )
+
+        @self.tree.command(
+            name="ticket-recovery",
+            description="Inspect or release an uncertain ticket request after staff review",
+        )
+        @app_commands.guild_only()
+        @guarded(self)
+        async def ticket_recovery(
+            interaction: discord.Interaction, request_id: str | None = None
+        ):
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await self.member(interaction, staff=True)
+            if request_id is None:
+                await self.recovery.run(interaction.guild)
+                requests = await self.store.requests()
+                text = (
+                    "\n".join(
+                        f"`{item['request_id']}` — owner {item['user_id']} — {item['category']}"
+                        for item in requests[:20]
+                    )
+                    or "No pending ticket requests."
+                )
+                text += "\n\n" + (
+                    "\n".join(self.recovery_problems[:10]) or "Recovery checks passed."
+                )
+                await interaction.followup.send(
+                    embed=self.embed("Ticket recovery", text[:4000]), ephemeral=True
+                )
+                return
+            request = await self.store.request(request_id)
+            if not request or request["status"] != "pending":
+                raise UserError("This request is missing or already resolved.")
+            await interaction.followup.send(
+                "Release this uncertain request only after inspecting Discord for an existing ticket. Confirmation checks for matching channels again. No channel will be deleted; any late matching channel will be archived by recovery.",
+                view=ReleaseRequest(self, interaction.user.id, request_id),
+                ephemeral=True,
             )
 
 
@@ -512,6 +813,7 @@ class VerificationPanel(View):
     @discord.ui.button(
         label="Verify", style=discord.ButtonStyle.success, custom_id="sz:verify"
     )
+    @guarded()
     async def verify(self, interaction, button):
         await self.bot.begin_verification(interaction)
 
@@ -522,6 +824,7 @@ class AnswerView(View):
         self.bot, self.owner = bot, owner
 
     @discord.ui.button(label="Enter code", style=discord.ButtonStyle.primary)
+    @guarded()
     async def enter(self, interaction, button):
         if interaction.user.id != self.owner:
             raise UserError("Start your own verification challenge.")
@@ -537,18 +840,26 @@ class AnswerModal(Modal, title="Community verification"):
         super().__init__(timeout=bot.config.verification.challenge_seconds)
         self.bot, self.owner = bot, owner
 
+    @guarded()
     async def on_submit(self, interaction):
         if interaction.user.id != self.owner:
             raise UserError("This challenge belongs to another member.")
         await interaction.response.defer(ephemeral=True, thinking=True)
         member = await self.bot.member(interaction)
         async with self.bot.lock(member.id):
-            self.bot.verification_eligible(member)
-            role = safe_role(member.guild, self.bot.config.verification.role_id or 0)
+            await self.bot.verification_eligible(member)
+            role = safe_role(
+                member.guild,
+                self.bot.config.verification.role_id or 0,
+                fresh_roles=await self.bot.role_map(member.guild),
+            )
             if not self.bot.challenges.check(member.id, self.answer.value):
                 raise UserError(
                     "That code did not match. Select Enter code and try again."
                 )
+            await self.bot.store.audit(
+                member.id, "Verification grant requested", role=role.id
+            )
             await member.add_roles(role, reason="Completed community verification")
             await interaction.followup.send(
                 "Verified! Welcome to State Zero Games.", ephemeral=True
@@ -575,14 +886,17 @@ class RoleSelect(discord.ui.Select):
             ],
         )
 
+    @guarded()
     async def callback(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         self.bot.cooldowns.take(("roles", interaction.user.id), 3)
         member = await self.bot.member(interaction, verified=True)
         selected = {int(value) for value in self.values}
         async with self.bot.lock(member.id):
+            fresh = await self.bot.role_map(member.guild)
             roles = {
-                o.role_id: safe_role(member.guild, o.role_id) for o in self.menu.options
+                o.role_id: safe_role(member.guild, o.role_id, fresh_roles=fresh)
+                for o in self.menu.options
             }
             if not selected <= roles.keys() or len(selected) > self.menu.max_selected:
                 raise UserError("Invalid role selection.")
@@ -597,6 +911,12 @@ class RoleSelect(discord.ui.Select):
                 for id_, r in roles.items()
                 if id_ not in selected and r in member.roles
             ]
+            await self.bot.store.audit(
+                member.id,
+                "Role change requested",
+                added=[role.id for role in adds],
+                removed=[role.id for role in removes],
+            )
             if adds:
                 await member.add_roles(
                     *adds, reason=f"Self-service menu {self.menu.key}"
@@ -647,6 +967,7 @@ class Compose(Modal, title="State Zero message composer"):
         ):
             raise UserError("Use an image attachment smaller than 8 MB.")
 
+    @guarded()
     async def on_submit(self, interaction):
         if interaction.user.id != self.owner:
             raise UserError("This form belongs to another staff member.")
@@ -673,6 +994,7 @@ class SendPreview(View):
     def __init__(self, composer, embed):
         super().__init__(timeout=300)
         self.composer, self.embed = composer, embed
+        self.bot = composer.bot
         self.used = False
         self.submit_lock = asyncio.Lock()
         if composer.channel and composer.bot.config.ping_role_ids:
@@ -693,7 +1015,10 @@ class SendPreview(View):
         return True
 
     @discord.ui.button(label="Confirm send", style=discord.ButtonStyle.primary)
+    @guarded()
     async def send(self, interaction, button):
+        if interaction.user.id != self.composer.owner:
+            raise UserError("This preview belongs to another staff member.")
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.submit_lock:
             if self.used:
@@ -720,6 +1045,12 @@ class SendPreview(View):
             if len(roles) > 25:
                 raise UserError("Choose at most 25 ping roles.")
             bot.cooldowns.take(("announce", interaction.user.id), 5)
+            await bot.store.audit(
+                interaction.user.id,
+                "Announcement send requested",
+                channel=channel.id,
+                pings=[role.id for role in roles],
+            )
             self.used = True
             self.stop()
             message = await channel.send(
@@ -742,7 +1073,10 @@ class SendPreview(View):
             )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    @guarded()
     async def cancel(self, interaction, button):
+        if interaction.user.id != self.composer.owner:
+            raise UserError("This preview belongs to another staff member.")
         async with self.submit_lock:
             if self.used:
                 raise UserError("This preview was already used.")
@@ -756,6 +1090,7 @@ class SendPreview(View):
 class PingSelect(discord.ui.Select):
     def __init__(self, preview, roles):
         self.preview = preview
+        self.bot = preview.composer.bot
         self.roles = {role.id: role for role in roles}
         selected = {role.id for role in preview.composer.ping_roles}
         super().__init__(
@@ -770,7 +1105,10 @@ class PingSelect(discord.ui.Select):
             ],
         )
 
+    @guarded()
     async def callback(self, interaction):
+        if interaction.user.id != self.preview.composer.owner:
+            raise UserError("This preview belongs to another staff member.")
         bot = self.preview.composer.bot
         await bot.member(interaction, staff=True)
         async with self.preview.submit_lock:
@@ -826,10 +1164,17 @@ class TicketSelect(discord.ui.Select):
             ],
         )
 
+    @guarded()
     async def callback(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
+        if not self.bot.tickets_ready:
+            raise UserError(
+                "Ticket safety checks are pending or require staff attention. Please try later."
+            )
         if self.bot.ticket_creation_lock.locked():
-            raise UserError("Another ticket is being created. Please try again shortly.")
+            raise UserError(
+                "Another ticket is being created. Please try again shortly."
+            )
         self.bot.cooldowns.take(("ticket", interaction.user.id), 60)
         member = await self.bot.member(interaction, verified=True)
         category = next(
@@ -842,38 +1187,22 @@ class TicketSelect(discord.ui.Select):
             )
         # Recheck after the member fetch. Do not build an unbounded creation queue.
         if self.bot.ticket_creation_lock.locked():
-            raise UserError("Another ticket is being created. Please try again shortly.")
+            raise UserError(
+                "Another ticket is being created. Please try again shortly."
+            )
         async with self.bot.ticket_creation_lock, self.bot.lock(member.id):
-            existing = self.bot.store.open_ticket(member.id)
+            existing = await self.bot.store.open_ticket(member.id)
             if existing:
                 try:
                     channel = await interaction.guild.fetch_channel(
                         existing["channel_id"]
                     )
                 except discord.NotFound:
-                    self.bot.store.close_ticket(existing["channel_id"])
+                    await self.bot.store.close_ticket(existing["channel_id"])
                 else:
                     raise UserError(
                         f"You already have an open ticket: {channel.mention}"
                     )
-            now = time.time()
-            limits = self.bot.config.limits
-            if (
-                self.bot.store.last_ticket_created(member.id)
-                > now - limits.ticket_reopen_seconds
-            ):
-                raise UserError("Please wait before opening another ticket.")
-            if self.bot.store.count_open_tickets() >= limits.max_open_tickets:
-                raise UserError(
-                    "The support queue is full. Please contact staff or try later."
-                )
-            if (
-                self.bot.store.count_recent_tickets(now - 3600)
-                >= limits.max_tickets_per_hour
-            ):
-                raise UserError(
-                    "Ticket creation is temporarily limited. Please try later."
-                )
             parent, support = validate_ticket_category(interaction.guild, category)
             if len(interaction.guild.channels) >= 490 or len(parent.channels) >= 49:
                 raise UserError(
@@ -910,18 +1239,42 @@ class TicketSelect(discord.ui.Select):
                     attach_files=True,
                     embed_links=True,
                 )
-            channel = await interaction.guild.create_text_channel(
-                f"{category.key}-{member.id}",
-                category=parent,
-                overwrites=overwrites,
-                reason=f"Private support ticket for {member.id}",
-                topic=f"State Zero ticket • owner {member.id} • {category.key}",
+            request = await self.bot.store.reserve_ticket(
+                secrets.token_hex(16),
+                member.id,
+                category.key,
+                parent.id,
+                category.support_role_ids,
+                self.bot.config.limits,
             )
             try:
-                self.bot.store.add_ticket(channel.id, member.id, category.key)
-            except Exception:
-                await channel.delete(reason="Ticket state could not be saved")
+                channel = await interaction.guild.create_text_channel(
+                    f"{category.key}-{member.id}",
+                    category=parent,
+                    overwrites=overwrites,
+                    reason=f"Private support ticket for {member.id}",
+                    topic=ticket_topic(request),
+                )
+            except discord.HTTPException as error:
+                if error.status in (400, 401, 403, 404):
+                    await self.bot.store.release_request(request["request_id"])
                 raise
+            private_ticket(
+                channel,
+                interaction.guild,
+                member.id,
+                category.support_role_ids,
+                parent_id=parent.id,
+            )
+            try:
+                await self.bot.store.complete_request(request["request_id"], channel.id)
+            except Exception:
+                log.error(
+                    "Ticket save interrupted; durable request retained for recovery"
+                )
+                raise UserError(
+                    "Your ticket may already exist. Staff recovery will reconcile it; do not submit another request."
+                ) from None
             # If the panel send fails, retain the ticket; /ticket-close still works.
             await channel.send(
                 embed=self.bot.embed(
@@ -946,27 +1299,79 @@ class TicketPanel(View):
 
 async def ticket_member(bot, interaction):
     member = await bot.member(interaction)
-    ticket = bot.store.ticket(interaction.channel_id)
+    ticket = await bot.store.ticket(interaction.channel_id)
     if not ticket or not isinstance(interaction.channel, discord.TextChannel):
         raise UserError("Use this command inside a bot-created ticket.")
     category = next(
         (c for c in bot.config.ticket_categories if c.key == ticket["category"]), None
     )
     support = set(category.support_role_ids) if category else set()
-    if (
-        member.id != ticket["user_id"]
-        and not bot.is_staff(member)
-        and not any(r.id in support for r in member.roles)
-    ):
+    private_ticket(interaction.channel, interaction.guild, ticket["user_id"], support)
+    is_support = any(r.id in support for r in member.roles)
+    staff = (
+        await bot.staff_access(member)
+        if not is_support
+        and (member.id != ticket["user_id"] or ticket["status"] != "open")
+        else False
+    )
+    if ticket["status"] != "open" and not staff and not is_support:
+        raise UserError(
+            "This ticket is archived or closing; only authorized staff can export it."
+        )
+    if member.id != ticket["user_id"] and not staff and not is_support:
         raise UserError("Only the ticket creator or support staff can use this action.")
     return member, ticket
 
 
+async def export_transcript(bot, interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if bot.operations.transcripts >= bot.config.limits.max_concurrent_transcripts:
+        raise UserError("Transcript export is busy. Try again shortly.")
+    bot.operations.transcripts += 1
+    try:
+        await ticket_member(bot, interaction)
+        bot.cooldowns.take(("transcript", interaction.channel_id), 30)
+        buffer = io.BytesIO()
+        header = (
+            "State Zero Games ticket transcript\nNewest 1,000 messages (text and attachment URLs only).\n"
+            f"Message Content Intent enabled: {bot.intents.message_content}. Content may be omitted by Discord when disabled.\n\n"
+        )
+        buffer.write(header.encode("utf-8"))
+        limit = min(interaction.guild.filesize_limit, 7_000_000)
+        async for message in interaction.channel.history(limit=1000):
+            content = message.content
+            for embed in message.embeds:
+                content += f"\n[Embed] {embed.title or ''}\n{embed.description or ''}"
+            for attachment in message.attachments:
+                content += f"\n[Attachment] {attachment.url}"
+            chunk = f"{message.created_at.isoformat()} | {message.author.id} | {content}\n\n".encode(
+                "utf-8"
+            )
+            if buffer.tell() + len(chunk) > limit:
+                raise UserError(
+                    "Transcript exceeds the upload limit. Contact staff for a smaller export."
+                )
+            buffer.write(chunk)
+        # Recheck revoked support access and ticket closure before delivering any content.
+        await ticket_member(bot, interaction)
+        buffer.seek(0)
+        await interaction.followup.send(
+            file=discord.File(buffer, filename=f"ticket-{interaction.channel_id}.txt"),
+            ephemeral=True,
+        )
+        await bot.audit(
+            interaction.user.id, "Transcript exported", channel=interaction.channel_id
+        )
+    finally:
+        bot.operations.transcripts -= 1
+
+
 async def request_close(bot, interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     _, ticket = await ticket_member(bot, interaction)
     if ticket["status"] != "open":
         raise UserError("This ticket is already closed.")
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Close this ticket? It will be archived, and the creator will lose access. Export a transcript first if needed. Staff can review the archived channel.",
         view=CloseTicket(bot, interaction.user.id),
         ephemeral=True,
@@ -983,6 +1388,7 @@ class TicketControls(View):
         style=discord.ButtonStyle.danger,
         custom_id="sz:close-ticket",
     )
+    @guarded()
     async def close_ticket(self, interaction, button):
         await request_close(self.bot, interaction)
 
@@ -993,22 +1399,24 @@ class CloseTicket(View):
         self.bot, self.owner = bot, owner
 
     @discord.ui.button(label="Confirm close", style=discord.ButtonStyle.danger)
+    @guarded()
     async def close_ticket(self, interaction, button):
         if interaction.user.id != self.owner:
             raise UserError("This confirmation belongs to someone else.")
         await interaction.response.defer(ephemeral=True, thinking=True)
         _, ticket = await ticket_member(self.bot, interaction)
         async with self.bot.lock(ticket["user_id"]):
-            ticket = self.bot.store.ticket(interaction.channel_id)
+            ticket = await self.bot.store.ticket(interaction.channel_id)
             if ticket["status"] != "open":
                 raise UserError("This ticket is already closed.")
+            await self.bot.store.begin_close(interaction.channel_id)
             target = interaction.guild.get_member(
                 ticket["user_id"]
             ) or await self.bot.fetch_user(ticket["user_id"])
             await interaction.channel.set_permissions(
                 target, view_channel=False, send_messages=False, reason="Ticket closed"
             )
-            self.bot.store.close_ticket(interaction.channel_id)
+            await self.bot.store.close_ticket(interaction.channel_id)
             self.stop()
             await interaction.followup.send(
                 "Ticket closed and archived for staff review.", ephemeral=True
@@ -1020,3 +1428,28 @@ class CloseTicket(View):
                 name=f"closed-{interaction.channel.name}"[:100],
                 reason="Ticket archived",
             )
+
+
+class ReleaseRequest(View):
+    def __init__(self, bot, owner, request_id):
+        super().__init__(timeout=120)
+        self.bot, self.owner, self.request_id = bot, owner, request_id
+
+    @discord.ui.button(label="Confirm release", style=discord.ButtonStyle.danger)
+    @guarded()
+    async def release(self, interaction, button):
+        if interaction.user.id != self.owner:
+            raise UserError("This confirmation belongs to another staff member.")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.bot.member(interaction, staff=True)
+        await self.bot.recovery.release(interaction.guild, self.request_id)
+        self.stop()
+        await self.bot.audit(
+            interaction.user.id,
+            "Uncertain ticket request released",
+            request=self.request_id,
+        )
+        await interaction.followup.send(
+            "Request released. Late matching channels will be archived by recovery.",
+            ephemeral=True,
+        )

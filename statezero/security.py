@@ -23,15 +23,40 @@ def read_token() -> str:
         if default_file.exists():
             path = str(default_file)
     if path:
-        file = Path(path)
-        if stat.S_IMODE(file.stat().st_mode) & 0o077:
-            raise UserError("Token file must be private (chmod 600).")
-        token = file.read_text().strip()
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            raise UserError(
+                "Token file is unavailable, unreadable, or a symbolic link."
+            ) from None
+        with os.fdopen(fd, "rb") as file:
+            metadata = os.fstat(file.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise UserError("Token secret must be a regular file.")
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise UserError("Token file must be private (chmod 600).")
+            if metadata.st_size > 4096:
+                raise UserError("Token file is too large.")
+            try:
+                token = file.read(4097).decode("ascii").strip()
+            except UnicodeDecodeError:
+                raise UserError(
+                    "Token file must contain only the Discord token."
+                ) from None
     else:
         token = environment_token
     if not token:
         raise UserError(
             "Set DISCORD_TOKEN through your hosting secret store, set DISCORD_TOKEN_FILE to a private secret file, or create secrets/discord_token with permissions 600."
+        )
+    if (
+        len(token) > 4096
+        or not token.isascii()
+        or not token.isprintable()
+        or any(character.isspace() for character in token)
+    ):
+        raise UserError(
+            "Token must contain only a single credential without internal whitespace."
         )
     return token
 
@@ -52,8 +77,10 @@ def image_url(url: str | None) -> str | None:
     return url
 
 
-def safe_role(guild: discord.Guild, role_id: int) -> discord.Role:
-    role = guild.get_role(role_id)
+def safe_role(guild: discord.Guild, role_id: int, *, fresh_roles=None) -> discord.Role:
+    role = (
+        fresh_roles.get(role_id) if fresh_roles is not None else guild.get_role(role_id)
+    )
     if role is None or guild.me is None:
         raise UserError("A configured role or the bot's member record is missing.")
     permitted = discord.Permissions(

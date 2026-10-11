@@ -52,6 +52,7 @@ One bot process with SQLite is a reasonable starting design for this target, sub
 | Ticket creation limits | Request a second ticket, make simultaneous requests from consenting testers, and lower staging quotas to exercise open/hourly limits and reopen cooldowns. | No duplicate open ticket per creator and no quota overrun. Busy/quota responses are clear; ordinary commands continue working. Restore intended production limits afterward. |
 | Ticket close/transcript | Export a transcript, close through confirmation, inspect access, and attempt another ticket before/after the cooldown. Test a transcript with the optional content intent enabled. | Authorized users alone receive transcripts. Closing removes the ordinary creator's access and retains support access. Content-intent status is accurate; configured cooldowns work. |
 | Existing panels after restart | Keep role/verification/ticket panels and an open ticket, restart the process, then operate them. | Persistent controls still respond and ticket ownership/verification lock state persist. |
+| Recovery reservations | Interrupt creation/closing, restart, inspect `/ticket-recovery`, exercise release confirmation and a late channel in staging. | Exact private channels are recovered once; interrupted closes finish; uncertain/ambiguous requests cannot create duplicates or delete channels blindly. |
 | Removed features | Inspect registered commands after startup sync. | `/dm` and `/dm-preferences` are absent. |
 
 Any unauthorized role grant, announcement, transcript access, or ticket visibility is a launch blocker. Fix it and repeat the affected tests. Do not accept a security failure as a harmless configuration warning.
@@ -66,17 +67,17 @@ Any unauthorized role grant, announcement, transcript access, or ticket visibili
 - [ ] Simulate a short network disruption on the test host and verify reconnection, useful logs, responsive commands afterward, and no duplicate sends from manual retries.
 - [ ] Check that logs, backups, Git history, container image/context, and shared screenshots contain no real token. Protect backups and downloaded transcripts with host access controls.
 - [ ] Check that private audit messages are visible only to intended staff. Set retention procedures for ticket channels, audit-channel messages, database records, and downloaded transcripts.
-- [ ] Confirm host uptime/error monitoring alerts an authorized operator and that the operator can pause verification and investigate. Alerts are a hosting/operations requirement; they are not configured by this repository.
+- [ ] Run `python main.py --health-check` inside the container and verify that a stale/disconnected snapshot exits 1. Confirm host uptime/error monitoring alerts an authorized operator and that the operator can pause verification and investigate. Alerts are a hosting/operations requirement; they are not configured by this repository.
 
-**Known recovery limitation:** Discord channel creation and the SQLite write are separate operations. A process crash after Discord creates a channel but before SQLite records it can leave an orphan channel. The bot does not currently automatically reconcile these orphans. Test and document safe staff cleanup; for a large public launch, add and validate stronger crash recovery before relying on unattended ticket operations. Similar interrupted operations must be checked for stale state. Never delete channels blindly during recovery.
+**Recovery policy:** A durable request is saved before channel creation. Startup/reconnect and periodic reconciliation adopt only exact saved markers with the expected owner, parent category, and private permissions. Interrupted closes are retried before the record becomes closed. Uncertain requests without a visible channel remain reserved for staff review; `/ticket-recovery` can release them after three minutes and a fresh channel scan, with confirmation and renewed staff authorization. Late channels matching released requests are archived. Test all of these paths on the live staging host. Duplicate/tampered markers and changed support permissions require manual investigation. Legacy untracked channels without saved markers cannot be automatically adopted safely. Never delete channels blindly.
 
 ## Capacity testing and monitoring
 
 Agree the target workload before running tests: expected peak joins/minute, verification attempts/minute, role updates/minute, ticket requests/minute, and announcement frequency. The configured defaults intentionally pause or reject some bursts; they are safety limits, not claims of measured capacity.
 
-1. Exercise realistic bursts locally with mocked Discord calls or a dedicated test harness. Include invalid requests and simultaneous actions, and test at least twice the planned peak workload as an initial headroom goal.
+1. Run `python tools/load_test.py --actions 5000 --concurrency 64` for a bounded local overload simulation, then exercise realistic feature bursts with mocked Discord calls or a dedicated test harness. Include invalid requests and simultaneous actions, and test at least twice the planned peak workload as an initial headroom goal.
 2. Confirm actual integration behavior with a modest number of consenting testers in the private server. Do not automate normal user accounts, create self-bots, or flood Discord's API. A local simulation does not establish Discord's real API throughput.
-3. Measure interaction acknowledgement time, ordinary command completion time, CPU, RAM, event-loop delays, database errors/lock waits, disconnects, and Discord rate-limit incidents. The current bot does not expose a metrics dashboard or measured percentile latency; add instrumentation or use appropriate hosting/tools before claiming load-test results.
+3. Measure interaction acknowledgement time, ordinary command completion time, CPU, RAM, event-loop delays, database errors/lock waits, disconnects, and Discord rate-limit incidents. The private health file records recent action-duration p95, sampled loop lag, database-call p95, gateway state, and queue/recovery status. It is not a public metrics dashboard, does not measure every acknowledgement deadline, and does not replace host CPU/RAM/disk monitoring or actual alerts. See deploy/PRODUCTION.md for collection and interpretation.
 4. Document the tested operating envelope and keep the configured limits inside it. Do not increase caps just to make a stress test pass.
 
 Suggested initial acceptance targets, to adapt to the intended workload and host:
@@ -90,7 +91,7 @@ Suggested initial acceptance targets, to adapt to the intended workload and host
 | After a burst | Processing recovers, memory does not keep growing under steady activity, and existing controls still work. |
 | Persistence | No lost/cross-owned open-ticket record or lost verification lock in restart/backup tests. Interrupted-operation exceptions must have tested recovery. |
 
-Fix unexplained failures. SQLite operations are synchronous and multi-process coordination is absent, so measured results may require architectural changes. Adding RAM or switching programming languages is not proof that a bottleneck or vulnerability is resolved.
+Fix unexplained failures. SQLite uses one bounded worker and multi-process coordination is absent, so measured results may require architectural changes. Adding RAM or switching programming languages is not proof that a bottleneck or vulnerability is resolved.
 
 ## Public-release decision
 

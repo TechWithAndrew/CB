@@ -8,10 +8,10 @@ Pelican already runs the egg in a container. The `Dockerfile` and Compose templa
 
 1. Upload the repository contents to the server's application directory, normally `/home/container`. `main.py`, `requirements.lock`, and the `statezero/` directory must be directly inside that directory, rather than inside an extra `CB/` folder. Never upload your development `.venv`, `.git` credentials, or a production token bundled with source code.
 2. Select a maintained Python 3.12+ image supported by the egg. Check the actual Python version in the container; the Python version on the panel host does not select the egg's runtime.
-3. Configure dependency installation to use **`requirements.lock`** if the egg offers a requirements-file variable. If it only uses `requirements.txt`, ask the provider to adjust the installer or startup template to install the lock file. The required installation command is:
+3. The updated **`requirements.txt` forwards to `requirements.lock`**, so the generic egg's normal requirements.txt installer already uses the complete hash-verified lock. If the egg offers a requirements-file variable, selecting requirements.lock directly also works. The required installation command is:
 
    ```bash
-   python -m pip install -r requirements.lock
+   python -m pip install --require-hashes -r requirements.lock
    ```
 
    Use the same interpreter/environment for installation and startup. If the image requires a virtual environment, install into `/home/container/.venv` and use `.venv/bin/python` in all commands below. Do not enable automatic package upgrades or automatic Git pulls on every restart.
@@ -74,7 +74,7 @@ Use separate development and production bot tokens. Require MFA on the panel/hos
 - Ask the provider to use a graceful interrupt (`SIGINT`) for stopping the Python process where the egg supports it, and allow time for shutdown. Test both stop/start and forced interruption in staging. Restarting the container must reconnect and preserve existing panels, open tickets, and the verification lock.
 - Enable supported restart-on-failure and node-reboot recovery. Verify the behavior on your provider; a crash loop should produce an alert rather than repeated unnoticed retries.
 - Start with approximately 2 vCPU and 2 GB RAM **available to the bot's container**, then measure actual traffic. These are planning figures, not demonstrated capacity requirements. A shared node's total resources are not the same as your egg's CPU/RAM limits. Keep swap/disk limits from hiding memory or storage pressure.
-- Use panel resource graphs and console logs, plus external uptime/error alerts. The bot currently has no metrics dashboard; confirm an operator receives alerts and can act. Complete the busy-period pilot, permissions, recovery, and traffic checks in TESTING.md.
+- Use panel resource graphs and console logs, plus external uptime/error alerts. The bot writes private aggregate health to `data/health.json`. Use `python main.py --health-check --health-file /home/container/data/health.json` inside the container through a provider-managed checker, and route failures to an operator. There is no public metrics dashboard or built-in alert delivery; see PRODUCTION.md. Complete the busy-period pilot, permissions, recovery, and traffic checks in TESTING.md.
 - The bot opens no inbound listening port. If the panel requires a port allocation, it is unused by this application. Allow outbound Discord HTTPS and secure gateway WebSockets, plus CDN access for transcripts as needed. Do not expose a database or Docker socket to make the bot work.
 
-The existing ticket crash-recovery limitation documented in TESTING.md still applies on Pelican. A different host does not establish public-server readiness or eliminate application security/recovery checks.
+Use [PRODUCTION.md](PRODUCTION.md) for durable ticket recovery, consistent backup commands, health collection, and safe upgrade procedures. A different host does not establish public-server readiness or eliminate the live checks in TESTING.md. Do not erase request IDs from ticket topics; recovery depends on their exact saved markers.

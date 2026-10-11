@@ -36,7 +36,7 @@ from statezero.security import (
     read_token,
     safe_role,
 )
-from statezero.storage import Store
+from statezero.storage import AsyncStore, Store
 
 
 class Role:
@@ -83,9 +83,15 @@ def make_guild():
     default = Role(123, default=True)
     me = Entity(
         top_role=Role(900, position=10),
+        id=999,
         guild_permissions=discord.Permissions(manage_roles=True, manage_channels=True),
     )
-    roles = {500: role, 600: support, 123: default}
+    roles = {
+        500: role,
+        600: support,
+        123: default,
+        650: Role(650, discord.Permissions(manage_guild=True), position=20),
+    }
     parent = MagicMock(spec=discord.CategoryChannel)
     parent.id = 700
     parent.channels = []
@@ -202,6 +208,21 @@ class SecurityTests(unittest.TestCase):
         record = logging.LogRecord("test", 20, "", 0, "error private-token", (), None)
         self.assertNotIn("private-token", formatter.format(record))
 
+    def test_logging_redacts_temporary_discord_webhook_credentials(self):
+        import logging
+
+        formatter = RedactedFormatter("private-token")
+        record = logging.LogRecord(
+            "discord.http",
+            30,
+            "",
+            0,
+            "Rate limit for https://discord.com/api/v10/webhooks/123/test-interaction-secret/messages/@original",
+            (),
+            None,
+        )
+        self.assertNotIn("test-interaction-secret", formatter.format(record))
+
     def test_default_token_file_requires_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             with chdir(directory), patch.dict(os.environ, {}, clear=True):
@@ -219,8 +240,11 @@ class SecurityTests(unittest.TestCase):
 
     def test_explicit_token_sources_override_default_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            with chdir(directory), patch.dict(
-                os.environ, {"DISCORD_TOKEN": "environment-test-secret"}, clear=True
+            with (
+                chdir(directory),
+                patch.dict(
+                    os.environ, {"DISCORD_TOKEN": "environment-test-secret"}, clear=True
+                ),
             ):
                 Path("secrets").mkdir(mode=0o700)
                 path = Path("secrets/discord_token")
@@ -300,10 +324,11 @@ class StorageTests(unittest.TestCase):
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.directory.name) / "state.db")
+        self.store = AsyncStore(Path(self.directory.name) / "state.db")
         self.config = Settings.model_validate(
             {
                 "guild_id": 123,
+                "announcement_channel_ids": [777],
                 "verification": {"role_id": 500},
                 "ping_role_ids": [600],
                 "ticket_categories": [
@@ -328,6 +353,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.bot = StudioBot(self.config, self.store)
+        self.bot.tickets_ready = True
+        self.bot.verification_locked = False
         self.guild, self.verified, self.support = make_guild()
         self.member = Entity(
             id=42,
@@ -346,14 +373,24 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.guild.fetch_member.return_value = self.member
         self.bot.audit = AsyncMock()
 
+        async def create_channel(name, **kwargs):
+            channel = self.guild.create_text_channel.return_value
+            channel.guild = self.guild
+            channel.topic = kwargs["topic"]
+            channel.category_id = kwargs["category"].id
+            channel.overwrites = kwargs["overwrites"]
+            return channel
+
+        self.guild.create_text_channel.side_effect = create_channel
+
     async def asyncTearDown(self):
         await self.bot.close()
-        self.store.close()
+        await self.store.close()
         self.directory.cleanup()
 
     async def test_offline_real_command_serialization(self):
         await offline_check(self.config)
-        self.assertEqual(len(self.bot.tree.get_commands()), 9)
+        self.assertEqual(len(self.bot.tree.get_commands()), 10)
         self.assertFalse(
             any(
                 command.name.startswith("dm")
@@ -386,11 +423,11 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             sum(isinstance(result, UserError) for result in results), 1, results
         )
         self.guild.create_text_channel.assert_awaited_once()
-        self.assertEqual(self.store.count_open_tickets(), 1)
+        self.assertEqual(await self.store.count_open_tickets(), 1)
 
     async def test_ticket_reopen_cooldown_survives_closed_ticket(self):
-        self.store.add_ticket(888, 42, "support")
-        self.store.close_ticket(888)
+        await self.store.add_ticket(888, 42, "support")
+        await self.store.close_ticket(888)
         select = TicketSelect(self.bot)
         select._values = ["support"]
         with self.assertRaisesRegex(UserError, "wait before opening"):
@@ -411,8 +448,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_hourly_ticket_quota_counts_closed_tickets(self):
         self.bot.config.limits.max_tickets_per_hour = 1
-        self.store.add_ticket(888, 99, "support")
-        self.store.close_ticket(888)
+        await self.store.add_ticket(888, 99, "support")
+        await self.store.close_ticket(888)
         select = TicketSelect(self.bot)
         select._values = ["support"]
         with self.assertRaisesRegex(UserError, "temporarily limited"):
@@ -447,7 +484,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(3):
             await self.bot.on_member_join(self.member)
         self.assertEqual(channel.send.await_count, 2)
-        self.store.set_setting("verification_locked", "1")
+        await self.bot.set_verification_lock(True)
         for _ in range(1000):
             await self.bot.on_member_join(self.member)
         self.assertEqual(channel.send.await_count, 2)
@@ -460,6 +497,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(UserError):
             await self.bot.member(it, staff=True)
         self.member.guild_permissions.manage_guild = True
+        self.member.roles.append(self.guild.get_role(650))
         self.assertIs(await self.bot.member(it, staff=True), self.member)
         self.member.roles = []
         with self.assertRaises(UserError):
@@ -478,7 +516,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(UserError):
             await modal.on_submit(interaction(self.guild))
-        self.store.set_setting("verification_locked", "1")
+        await self.bot.set_verification_lock(True)
         self.bot.challenges.create(42)
         with self.assertRaises(UserError):
             await modal.on_submit(interaction(self.guild))
@@ -490,6 +528,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.guild.get_role = lambda id_: (
             {501: role_a, 502: role_b}.get(id_) or original_lookup(id_)
         )
+        self.guild.fetch_roles.return_value.extend([role_a, role_b])
         self.member.roles.append(role_a)
         select = RoleSelect(self.bot, self.config.role_menus[0])
         select._values = ["502"]
@@ -524,7 +563,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(overwrites[self.guild.default_role].view_channel)
         self.assertTrue(overwrites[self.support].view_channel)
         self.assertTrue(overwrites[self.member].view_channel)
-        self.assertEqual(self.store.open_ticket(42)["channel_id"], 888)
+        self.assertEqual((await self.store.open_ticket(42))["channel_id"], 888)
 
     async def test_ticket_rejects_everyone_support(self):
         category = self.config.ticket_categories[0].model_copy(
@@ -536,8 +575,14 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_ticket_authorization_and_close(self):
         channel = MagicMock(spec=discord.TextChannel)
         channel.id, channel.name = 888, "support-42"
+        channel.guild = self.guild
+        channel.overwrites = {
+            self.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            self.member: discord.PermissionOverwrite(view_channel=True),
+            self.support: discord.PermissionOverwrite(view_channel=True),
+        }
         channel.set_permissions, channel.edit = AsyncMock(), AsyncMock()
-        self.store.add_ticket(888, 42, "support")
+        await self.store.add_ticket(888, 42, "support")
         self.bot.fetch_user = AsyncMock(return_value=self.member)
         it = interaction(self.guild, channel=channel)
         self.assertEqual((await ticket_member(self.bot, it))[1]["user_id"], 42)
@@ -548,7 +593,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.guild.fetch_member.return_value = self.member
         close = CloseTicket(self.bot, 42)
         await close.close_ticket.callback(it)
-        self.assertIsNone(self.store.open_ticket(42))
+        self.assertIsNone(await self.store.open_ticket(42))
         channel.set_permissions.assert_awaited_once_with(
             self.member, view_channel=False, send_messages=False, reason="Ticket closed"
         )
@@ -557,6 +602,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_announcement_only_explicit_ping_no_double_send(self):
         self.member.guild_permissions.manage_guild = True
+        self.member.roles.append(self.guild.get_role(650))
         channel = MagicMock(spec=discord.TextChannel)
         channel.guild, channel.id, channel.mention = self.guild, 777, "<#777>"
         channel.permissions_for.return_value = discord.Permissions(
@@ -589,8 +635,24 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             await preview.send.callback(interaction(self.guild))
         channel.send.assert_not_awaited()
 
+    async def test_another_staff_cannot_send_or_cancel_preview_directly(self):
+        self.member.guild_permissions.manage_guild = True
+        self.member.roles.append(self.guild.get_role(650))
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.guild = self.guild
+        channel.send = AsyncMock()
+        preview = SendPreview(
+            Compose(self.bot, 42, channel=channel), self.bot.embed("Hello", "Test")
+        )
+        for callback in (preview.send.callback, preview.cancel.callback):
+            with self.assertRaisesRegex(UserError, "another staff"):
+                await callback(interaction(self.guild, 43))
+        self.assertFalse(preview.used)
+        channel.send.assert_not_awaited()
+
     async def test_announcement_no_ping_and_unapproved_ping_rejected(self):
         self.member.guild_permissions.manage_guild = True
+        self.member.roles.append(self.guild.get_role(650))
         channel = MagicMock(spec=discord.TextChannel)
         channel.guild, channel.id, channel.mention = self.guild, 777, "<#777>"
         channel.permissions_for.return_value = discord.Permissions(
@@ -612,6 +674,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multiple_ping_roles_and_clear_selection(self):
         self.member.guild_permissions.manage_guild = True
+        self.member.roles.append(self.guild.get_role(650))
         second = Role(601)
         second.guild = self.guild
         self.bot.config.ping_role_ids = [600, 601]
@@ -622,7 +685,11 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         )
         channel.send = AsyncMock(return_value=NS(id=999))
         self.guild.fetch_channel.return_value = channel
-        self.guild.fetch_roles.return_value = [self.support, second]
+        self.guild.fetch_roles.return_value = [
+            self.support,
+            second,
+            self.guild.get_role(650),
+        ]
         composer = Compose(self.bot, 42, channel=channel)
         preview = SendPreview(composer, self.bot.embed("Hello", "Test"))
         select = PingSelect(preview, [self.support, second])
@@ -641,6 +708,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compose_preserves_paragraphs_and_image_in_preview(self):
         self.member.guild_permissions.manage_guild = True
+        self.member.roles.append(self.guild.get_role(650))
         channel = MagicMock(spec=discord.TextChannel)
         channel.guild, channel.id, channel.mention = self.guild, 777, "<#777>"
         channel.permissions_for.return_value = discord.Permissions(
@@ -661,9 +729,9 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.bot.config.verification.raid_join_count = 2
         await self.bot.on_member_join(self.member)
         await self.bot.on_member_join(self.member)
-        self.assertEqual(self.store.setting("verification_locked"), "1")
+        self.assertEqual(await self.store.setting("verification_locked"), "1")
         with self.assertRaises(UserError):
-            self.bot.verification_eligible(self.member)
+            await self.bot.verification_eligible(self.member)
         self.bot.audit.assert_awaited_once()
 
 

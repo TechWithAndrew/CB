@@ -3,7 +3,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-Snowflake = Annotated[int, Field(gt=0)]
+Snowflake = Annotated[int, Field(gt=0, le=(1 << 64) - 1)]
 Key = Annotated[str, Field(pattern=r"^[a-z0-9_-]{1,32}$")]
 
 
@@ -86,11 +86,21 @@ class TicketCategory(Model):
 
 
 class Limits(Model):
+    max_concurrent_actions: int = Field(default=32, ge=1, le=128)
+    interactions_per_minute: int = Field(default=180, ge=10, le=1000)
+    interactions_per_user_per_minute: int = Field(default=20, ge=3, le=60)
+    max_concurrent_transcripts: int = Field(default=2, ge=1, le=4)
     max_open_tickets: int = Field(default=100, ge=1, le=400)
     max_tickets_per_hour: int = Field(default=60, ge=1, le=1000)
     ticket_reopen_seconds: int = Field(default=600, ge=60, le=86400)
     welcome_messages_per_minute: int = Field(default=20, ge=1, le=300)
     verification_challenges_per_minute: int = Field(default=30, ge=1, le=300)
+
+
+class Operations(Model):
+    health_interval_seconds: int = Field(default=15, ge=5, le=60)
+    recovery_interval_seconds: int = Field(default=300, ge=60, le=3600)
+    action_timeout_seconds: int = Field(default=60, ge=10, le=120)
 
 
 class Settings(Model):
@@ -99,6 +109,7 @@ class Settings(Model):
     welcome_channel_id: Snowflake | None = None
     audit_channel_id: Snowflake | None = None
     announcement_channel_ids: list[Snowflake] = Field(default_factory=list)
+    allow_any_announcement_channel: bool = False
     ping_role_ids: list[Snowflake] = Field(default_factory=list, max_length=25)
     require_verified_for_features: bool = True
     branding: Branding = Field(default_factory=Branding)
@@ -106,6 +117,7 @@ class Settings(Model):
     role_menus: list[RoleMenu] = Field(default_factory=list, max_length=20)
     ticket_categories: list[TicketCategory] = Field(default_factory=list, max_length=25)
     limits: Limits = Field(default_factory=Limits)
+    operations: Operations = Field(default_factory=Operations)
 
     @model_validator(mode="after")
     def distinct_keys_and_roles(self):

@@ -59,6 +59,16 @@
     "max_tickets_per_hour": 60,
     "ticket_reopen_seconds": 600,
     "welcome_messages_per_minute": 20,
-    "verification_challenges_per_minute": 30
+    "verification_challenges_per_minute": 30,
+    "max_concurrent_actions": 32,
+    "interactions_per_minute": 180,
+    "interactions_per_user_per_minute": 20,
+    "max_concurrent_transcripts": 2
+  },
+  "allow_any_announcement_channel": false,
+  "operations": {
+    "health_interval_seconds": 15,
+    "recovery_interval_seconds": 300,
+    "action_timeout_seconds": 60
   }
 }

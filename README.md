@@ -30,7 +30,7 @@ A configurable Discord bot for the State Zero Games studio community, built with
 6. Edit `config.json`:
    - Set `guild_id`, `verification.role_id`, `welcome_channel_id`, and a private `audit_channel_id`.
    - Set `staff_role_ids` to the staff allowed to compose messages/post panels. Members with Discord **Manage Server** can always use staff commands. Support Team members can manage their assigned tickets without receiving general bot staff access.
-   - Populate `announcement_channel_ids` to restrict announcement destinations. An empty list allows staff to choose any text channel in this server.
+   - Populate `announcement_channel_ids` with approved announcement destinations. An empty list disables announcements by default. `allow_any_announcement_channel: true` explicitly permits any server text channel when the list is empty; leave it false for production.
    - Populate `ping_role_ids` with every role the bot may ping. An empty list disables all role pings. `@everyone` and `@here` are never allowed.
    - In **each** ticket category, set `parent_id` to a Discord category ID and `support_role_ids` to the support roles for that category. Multiple ticket types may use the same Discord category, or different ones.
    - Customize branding, welcome text/image, challenge rules, ticket text, traffic limits, and role menus. The example IDs below are placeholders to replace, not usable IDs.
@@ -76,6 +76,7 @@ Moderators can manually grant the Verified role to legitimate members who need a
 | `/ticket-close` | Creator/support/staff | Confirm and archive the current ticket. |
 | `/ticket-transcript` | Creator/support/staff | Privately export the newest 1,000 messages. |
 | `/bot-status` | Staff | Show configuration problems and safety status. |
+| `/ticket-recovery [request_id]` | Staff | Run reconciliation and inspect pending requests; supplying a request ID opens a guarded release confirmation. |
 
 Forms support real line breaks, blank lines, and Discord Markdown such as `**bold**`, `*italic*`, headings, lists, and links. Titles are limited to 256 characters and bodies to 4,000 characters, matching Discord form/embed limits. For longer announcements, split the content into multiple posts. Image attachments must be under 8 MB. Attachments use Discord's hosted URL, so links can expire; a durable HTTPS URL is preferable for long-lived announcements. No arbitrary image URL is fetched by the bot itself.
 
@@ -122,7 +123,7 @@ For complete user-message transcripts, enable Message Content Intent in the Deve
 
 ## Pelican Panel deployment
 
-Use a Python 3.12+ code egg with `main.py` as its script entry point, install dependencies from `requirements.lock`, and keep `config.json` and `data/` on the persistent server volume. See [deploy/PELICAN.md](deploy/PELICAN.md) for startup settings, token handling, backups, and checks. Pelican already supplies the container; the Compose template below is for a separate Docker host.
+Use a Python 3.12+ code egg with `main.py` as its script entry point. `requirements.txt` forwards to the full hash-verified `requirements.lock`, so eggs that automatically install requirements.txt use the same pins. Keep `config.json` and `data/` on the persistent server volume. See [deploy/PELICAN.md](deploy/PELICAN.md) for startup settings and [deploy/PRODUCTION.md](deploy/PRODUCTION.md) for monitoring, recovery, upgrades, and release procedures. Pelican already supplies the container; the Compose template below is for a separate Docker host.
 
 Restrict panel access to startup variables, executable files, console/SFTP, and backups. A hidden token field alone does not provide secret isolation from privileged panel or node users.
 
@@ -168,9 +169,15 @@ Before going live, verify with a normal non-staff account: an unverified member 
 
 Use [TESTING.md](TESTING.md) for the step-by-step live tests, evidence to record, recovery checks, and public-release criteria.
 
-This is a single-server, single-process bot. It avoids loading the full member list at startup and fetches individual members when checking permissions. Discord API rate limiting is handled by discord.py; local limits reduce avoidable work and channel creation. SQLite is appropriate for this deployment shape, but its operations are synchronous and its performance under your traffic has not been established. For multiple bot replicas, move persistence to a shared transactional database and replace process-local locks/rate windows with distributed controls before scaling.
+This is a single-server, single-process Linux bot. It avoids loading the full member list at startup and fetches individual members when checking permissions. It leaves unconfigured Discord servers. Discord API rate limiting is handled by discord.py; local limits reduce avoidable work and channel creation. SQLite runs on a dedicated worker with at most 64 pending calls, preventing disk waits from blocking the gateway loop. An exclusive file lock rejects another process using the same database, and persistent guild binding rejects reuse with another configured server. Performance under real traffic still needs measurement. Multiple replicas require shared persistence and distributed coordination; copying the database/token does not provide safe redundancy.
 
 The `limits` configuration defaults to 100 open tickets, 60 new tickets per hour, a 600-second per-user reopen cooldown, 20 welcomes per minute, and 30 new verification challenges per minute. Ticket limits and reopen history survive restarts. Creation is serialized across members to prevent quota races. The bot also refuses new tickets when the server has at least 490 channels or the parent category has at least 49 children. Archived channels continue consuming Discord's capacity; staff must clean them up. Limits intentionally reject or suppress work instead of queueing an unlimited backlog. Adjust them cautiously after measurement.
+
+Public callbacks default to 32 concurrent member actions, 180 accepted member interactions per minute, and 20 interactions per member per minute. Staff have eight reserved action slots and a separate 60-per-minute window; cached roles reserve capacity only, while actual authorization is fetched again. Actions have a 60-second timeout. Transcript exports are limited to two concurrent bounded buffers. Audit notifications are queued and batched with a fixed memory cap; successfully recorded events remain in SQLite even if a Discord notification is skipped. These are safety budgets, not claims of Discord throughput.
+
+Ticket creation saves a durable request ID before the API call and includes it in the channel topic. Startup/reconnect and periodic recovery reconcile exact saved requests, validate ownership/private overwrites, retry interrupted closes, and close stale records for channels confirmed absent by a fresh channel-list request. Unknown or duplicate markers are never blindly adopted/deleted. Uncertain requests without a visible channel hold a reservation for staff review. `/ticket-recovery` provides a guarded release after three minutes; a late matching channel is subsequently archived. Keep ticket topics intact. Legacy untracked channels without saved markers require manual review.
+
+Private aggregate health is written to `data/health.json` every 15 seconds. Health and consistent SQLite backup commands do not read the token or connect to Discord; see [deploy/PRODUCTION.md](deploy/PRODUCTION.md). Host alert delivery and encrypted off-host storage still need configuration by your provider.
 
 The project is ready for **staging evaluation**, not certified for unrestricted large-server deployment. Mocked tests cannot prove live Discord permissions, gateway resilience, human verification, or capacity. Before public rollout:
 
@@ -189,7 +196,7 @@ Environment publication and GitHub publication are separate operations. GitHub r
 ```bash
 git status --short
 # Stage only the source/documentation files you intend to publish.
-git add main.py statezero tests README.md config.example.json requirements.txt requirements.lock pyproject.toml deploy .gitignore .dockerignore
+git add main.py statezero tests tools README.md config.example.json requirements.txt requirements.lock pyproject.toml deploy .gitignore .dockerignore
 git diff --cached --check
 git diff --cached --stat
 git commit -m "Describe the change"
