@@ -4,14 +4,15 @@ The current bot has passing automated tests and basic security controls. It is n
 
 Server member count alone does not determine capacity: peak joins, command clicks, concurrent ticket requests, and the hosting resources matter more. One bot instance is supported. Do not start multiple copies sharing SQLite to increase capacity.
 
-## Your initial deployment: under 5,000 members on a VPS
+## Your initial deployment: under 5,000 members on Pelican Panel
 
-One bot process with SQLite is a reasonable starting design for this target, subject to the traffic tests below. A VPS with roughly 2 vCPU, 2 GB RAM, and SSD storage is a practical starting budget, not a measured minimum or a capacity guarantee. Monitor the actual deployment before buying more resources or changing the architecture.
+One bot process with SQLite is a reasonable starting design for this target, subject to the traffic tests below. Use a Python 3.12+ code egg following [deploy/PELICAN.md](deploy/PELICAN.md). Roughly 2 vCPU, 2 GB RAM, and SSD storage available to the bot container is a practical starting budget, not a measured minimum or a capacity guarantee. Monitor the actual deployment before buying more resources or changing the architecture.
 
-- Use a maintained Linux release and promptly apply security updates. Keep the bot under a dedicated unprivileged user or the restricted container in deploy/compose.yaml.
+- Use a maintained egg image and an unprivileged container user. The provider/node administrator must maintain the panel, Wings, Docker, and Linux host. Do not run the repository's Compose deployment inside the egg.
 - Use SSH keys, MFA for the hosting-provider and GitHub accounts, and a host firewall. Confirm key-based access works before disabling SSH password login. Restrict SSH access where practical. The bot needs no inbound application ports; do not expose a Docker daemon, SQLite file, or metrics endpoint publicly.
 - Prefer a provider secret manager if available. Otherwise keep the token in a private runtime-owned file outside the repository, with mode `0600`, on protected/encrypted storage. Never put the usable token in a container image or Compose YAML. Protect who can access the host and Docker socket; they can otherwise access runtime secrets.
 - Arrange automatic process restart, external uptime/error alerts, CPU/RAM/disk monitoring, consistent encrypted backups, and an operator who receives and can act on alerts. The bot itself does not set these up on an external VPS.
+- Verify panel subuser permissions for startup variables, files/SFTP, console, and backups. Test that `/home/container/data` survives restart/node reboot and that release uploads preserve configuration and database files. A hidden variable or a panel status of Running does not prove secret isolation or a working Discord connection.
 - Use consenting staff/testers in a private server first. A 72-hour small-group pilot is a starting observation period; include a planned busy period or playtest rather than counting idle uptime as a capacity test.
 - Pay particular attention to the default raid threshold of 10 joins in 60 seconds: a legitimate launch can trigger it. Test the pause behavior and staffing response, then set the threshold based on observed legitimate traffic. Do not turn off protection or increase every limit just to avoid testing failures.
 

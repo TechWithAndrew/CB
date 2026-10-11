@@ -114,11 +114,17 @@ For complete user-message transcripts, enable Message Content Intent in the Deve
 ## Token and data security
 
 - A Discord bot token is a bearer credential. Use an encrypted hosting secret manager for storage, TLS for Discord traffic, and restrictive runtime permissions. The application must still read the usable token in memory to connect to Discord. Encrypting it in source code with a key stored beside it does not protect it.
-- Prefer a mounted secret file outside the repository, owned by the runtime user with mode `0600`. `DISCORD_TOKEN_FILE` takes precedence over `DISCORD_TOKEN`. The bot rejects group/world-readable token files. In containers, ensure the source file is readable by UID 10001 while keeping mode `0600`.
+- Prefer a mounted secret file outside the repository, owned by the runtime user with mode `0600`. `DISCORD_TOKEN_FILE` takes precedence over `DISCORD_TOKEN`. The bot rejects group/world-readable token files. The provided Docker template uses UID 10001; a Pelican egg may use a different runtime UID. Ensure that actual user can read the file while keeping mode `0600`.
 - Token values are excluded from config and audit events, `.env` and runtime data are Git-ignored, and log output redacts the active token. Do not enable HTTP header tracing or share process environments. If a token is exposed, reset it in the Developer Portal immediately and replace the secret.
 - SQLite stores member IDs, verification lock status, ticket ownership/status, and action metadata. It does not store tokens, CAPTCHA answers, or message bodies. CAPTCHA answers exist only as keyed hashes with a short expiry; challenges reset on restart. Audit rows older than 90 days are pruned when a new audit event is recorded. Discord audit-channel messages are not automatically pruned. Ticket records persist until your administrator removes them.
 - Protect `data/` and backups using host access controls and encrypted storage. Keep a backup of `data/statezero.db` using SQLite's backup API while stopped or through a consistent backup process. Persistent panels need both the configuration and database after restoring the host.
 - Use a maintained host, run as an unprivileged user, update dependency pins intentionally, and review changes before deployment. No claim of absolute security is made.
+
+## Pelican Panel deployment
+
+Use a Python 3.12+ code egg with `main.py` as its script entry point, install dependencies from `requirements.lock`, and keep `config.json` and `data/` on the persistent server volume. See [deploy/PELICAN.md](deploy/PELICAN.md) for startup settings, token handling, backups, and checks. Pelican already supplies the container; the Compose template below is for a separate Docker host.
+
+Restrict panel access to startup variables, executable files, console/SFTP, and backups. A hidden token field alone does not provide secret isolation from privileged panel or node users.
 
 ## Docker deployment
 
@@ -183,7 +189,7 @@ Environment publication and GitHub publication are separate operations. GitHub r
 ```bash
 git status --short
 # Stage only the source/documentation files you intend to publish.
-git add statezero tests README.md config.example.json requirements.txt requirements.lock pyproject.toml deploy .gitignore .dockerignore
+git add main.py statezero tests README.md config.example.json requirements.txt requirements.lock pyproject.toml deploy .gitignore .dockerignore
 git diff --cached --check
 git diff --cached --stat
 git commit -m "Describe the change"
