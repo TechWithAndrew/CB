@@ -4,7 +4,7 @@ Validated on October 11, 2026. These are local automated checks and simulations,
 
 ## Checks
 
-- 83 automated tests pass in a fresh Python 3.12 environment installed from the hash-verified runtime lock.
+- 85 automated tests pass in a fresh Python 3.12 environment installed from the hash-verified runtime lock.
 - Offline configuration, real slash-command serialization, and persistent component construction pass. No Discord login or messages are involved.
 - pip check reports no broken runtime requirements. Ruff syntax/import/async checks and formatting pass.
 - A pip-audit scan of all 16 pinned runtime packages reports no known vulnerabilities. Advisory coverage does not establish absence of unknown/application/OS issues.
@@ -12,7 +12,7 @@ Validated on October 11, 2026. These are local automated checks and simulations,
 - Forced process exit retains the committed ticket request; cross-process database ownership is rejected; legacy ticket/lock state migrates; a consistent live backup includes WAL state and restores successfully.
 - Recovery tests cover missing/duplicate/forged markers, unexpected parents/permissions, database completion failure after creation, uncertain API failure, failed permission updates during closing, staff release checks, late channels, and idempotent adoption without deletion.
 - Authorization tests cover stale cached permission bits, fresh role definitions, current owner metadata, revoked staff/support access, non-owner previews, archived transcripts, storage failure before a role grant, and unsafe audit destinations. Token tests cover file permissions, symlinks/FIFOs, oversized/control-character values, and credential redaction including temporary webhook URLs.
-- Overload tests cap active work, reserve staff capacity, bound per-user/global windows, cancel/drain sibling reads, retain submitted durable writes on cancellation, observe background failures, and stop transcripts at their size/concurrency bounds.
+- Overload tests cap active work and error replies, reserve staff capacity, bound per-user/global windows, cancel/drain sibling reads, retain submitted durable writes on cancellation, observe background failures, and stop transcripts at their size/concurrency bounds. Current Discord timeouts block privileged actions too.
 
 ## Restricted container check
 

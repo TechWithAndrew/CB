@@ -21,6 +21,7 @@ from statezero.bot import (
     ReleaseRequest,
     StudioBot,
     TicketSelect,
+    explain,
     export_transcript,
     ticket_member,
 )
@@ -433,6 +434,33 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(
             await self.bot.member(interaction(self.guild), staff=True), self.member
         )
+
+    async def test_current_member_timeout_blocks_privileged_actions(self):
+        self.member.roles = [self.guild.get_role(650)]
+        self.member.is_timed_out = lambda: True
+        with self.assertRaisesRegex(UserError, "timeout"):
+            await self.bot.member(interaction(self.guild), staff=True)
+
+    async def test_overload_error_notices_do_not_create_an_unbounded_http_queue(self):
+        held = asyncio.Event()
+        notices = []
+
+        async def send_notice(*args, **kwargs):
+            notices.append(1)
+            await held.wait()
+
+        it = interaction(self.guild)
+        it.client = self.bot
+        it.response.send_message = send_notice
+        tasks = [
+            asyncio.create_task(explain(it, UserError("busy"))) for _ in range(200)
+        ]
+        await asyncio.sleep(0)
+        self.assertEqual(len(notices), 8)
+        self.assertEqual(self.bot.operations.counts["error_responses_suppressed"], 192)
+        held.set()
+        await asyncio.gather(*tasks)
+        self.assertEqual(self.bot.operations.error_responses, 0)
 
     async def test_elevated_verification_role_is_rejected_even_if_cache_is_safe(self):
         self.member.roles = []

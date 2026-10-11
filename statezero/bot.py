@@ -30,14 +30,37 @@ async def explain(interaction: discord.Interaction, error: Exception):
     else:
         log.error("Action failed (%s)", type(error).__name__)
         message = "This action failed. Ask a server administrator to check the bot configuration."
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
-        )
-    else:
-        await interaction.response.send_message(
-            message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
-        )
+    client = getattr(interaction, "client", None)
+    operations = getattr(client, "operations", None)
+    if operations:
+        if operations.error_responses >= 8:
+            operations.counts["error_responses_suppressed"] += 1
+            return
+        try:
+            operations.error_rate.take()
+        except UserError:
+            operations.counts["error_responses_suppressed"] += 1
+            return
+        operations.error_responses += 1
+    try:
+        async with asyncio.timeout(2):
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    message,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await interaction.response.send_message(
+                    message,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+    except (TimeoutError, discord.HTTPException):
+        log.warning("Error notice could not be delivered")
+    finally:
+        if operations:
+            operations.error_responses -= 1
 
 
 class View(discord.ui.View):
@@ -129,6 +152,10 @@ class StudioBot(discord.Client):
             ) from None
         if member.bot:
             raise UserError("This feature is for community members.")
+        if getattr(member, "is_timed_out", lambda: False)():
+            raise UserError(
+                "Bot actions are unavailable while your Discord timeout is active."
+            )
         if staff and not authorized:
             raise UserError(
                 "This action requires Manage Server or a configured staff role."

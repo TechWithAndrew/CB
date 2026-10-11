@@ -40,6 +40,8 @@ class Operations:
         self.limits, self.timeout = limits, timeout
         self.active = self.staff_active = 0
         self.transcripts = 0
+        self.error_responses = 0
+        self.error_rate = RateWindow(120, 60)
         self.rate = RateWindow(limits.interactions_per_minute, 60)
         self.staff_rate = RateWindow(60, 60)
         self.users = OrderedDict()

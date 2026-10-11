@@ -38,6 +38,8 @@ These settings belong in config.json. They are conservative policies, not measur
 
 Database work uses one executor with at most 64 pending calls. Cancelled submissions may finish durable writes on that worker; this preserves recovery state instead of losing an intent at a timeout. Health/audit metric windows are bounded. Discord audit notifications are batched through a 100-event queue; every successfully saved SQLite audit event persists even if a notification is dropped. Queue drops and unexpected background-task failures are visible in health counters. Role grants, role changes, and announcement sends record a durable audit intent before their Discord write, so an unavailable audit store stops those actions. Full disk/storage errors still require operator action.
 
+Error replies have a separate limit of eight concurrent sends, 120 per minute, and a two-second delivery timeout. During extreme overload, replies beyond those limits are suppressed rather than queued; affected members may see Discord's interaction-failed notice. The health counter error_responses_suppressed records this condition. Current Discord timeouts also block member and staff bot actions.
+
 Member count is not a workload measure. Agree peak joins, verification attempts, role updates, ticket requests, and announcements before tuning. Test busy playtests/releases on the actual host. The current SQLite/gateway architecture is one process; more replicas require a different shared persistence/coordination design. Discord still limits channel counts and API traffic. Archived tickets must be cleaned up under your retention policy or category capacity will eventually block new tickets.
 
 ## Health collection and alerts
