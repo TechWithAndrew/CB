@@ -26,7 +26,7 @@ Multiple replicas are not supported: process-local locks and rate windows do not
 
 ## Validation performed
 
-The current version passes 31 local automated tests, offline command/panel serialization, dependency consistency, and Ruff static checks. A pip-audit scan of all pinned runtime dependencies found no known reported vulnerabilities. This finding is advisory database coverage at scan time, not a guarantee against unknown or application-level vulnerabilities. GitHub Actions repeats the tests and dependency advisory check; its execution status is separate from the locally verified results.
+The current version passes 32 local automated tests, offline command/panel serialization, dependency consistency, and Ruff static checks. A pip-audit scan of all pinned runtime dependencies found no known reported vulnerabilities. This finding is advisory database coverage at scan time, not a guarantee against unknown or application-level vulnerabilities. GitHub Actions repeats the tests and dependency advisory check; its execution status is separate from the locally verified results.
 
 ## Reporting and rotation
 

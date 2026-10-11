@@ -362,6 +362,18 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             await select.callback(interaction(self.guild))
         self.guild.create_text_channel.assert_not_awaited()
 
+    async def test_busy_ticket_creation_rejects_without_member_fetch(self):
+        select = TicketSelect(self.bot)
+        select._values = ["support"]
+        await self.bot.ticket_creation_lock.acquire()
+        try:
+            with self.assertRaisesRegex(UserError, "being created"):
+                await select.callback(interaction(self.guild))
+        finally:
+            self.bot.ticket_creation_lock.release()
+        self.guild.fetch_member.assert_not_awaited()
+        self.guild.create_text_channel.assert_not_awaited()
+
     async def test_hourly_ticket_quota_counts_closed_tickets(self):
         self.bot.config.limits.max_tickets_per_hour = 1
         self.store.add_ticket(888, 99, "support")

@@ -828,6 +828,8 @@ class TicketSelect(discord.ui.Select):
 
     async def callback(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.bot.ticket_creation_lock.locked():
+            raise UserError("Another ticket is being created. Please try again shortly.")
         self.bot.cooldowns.take(("ticket", interaction.user.id), 60)
         member = await self.bot.member(interaction, verified=True)
         category = next(
@@ -838,6 +840,9 @@ class TicketSelect(discord.ui.Select):
             raise UserError(
                 "This category is no longer configured. Ask staff to update the panel."
             )
+        # Recheck after the member fetch. Do not build an unbounded creation queue.
+        if self.bot.ticket_creation_lock.locked():
+            raise UserError("Another ticket is being created. Please try again shortly.")
         async with self.bot.ticket_creation_lock, self.bot.lock(member.id):
             existing = self.bot.store.open_ticket(member.id)
             if existing:
