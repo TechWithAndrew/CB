@@ -160,6 +160,8 @@ Before going live, verify with a normal non-staff account: an unverified member 
 
 ## Capacity and production rollout
 
+Use [TESTING.md](TESTING.md) for the step-by-step live tests, evidence to record, recovery checks, and public-release criteria.
+
 This is a single-server, single-process bot. It avoids loading the full member list at startup and fetches individual members when checking permissions. Discord API rate limiting is handled by discord.py; local limits reduce avoidable work and channel creation. SQLite is appropriate for this deployment shape, but its operations are synchronous and its performance under your traffic has not been established. For multiple bot replicas, move persistence to a shared transactional database and replace process-local locks/rate windows with distributed controls before scaling.
 
 The `limits` configuration defaults to 100 open tickets, 60 new tickets per hour, a 600-second per-user reopen cooldown, 20 welcomes per minute, and 30 new verification challenges per minute. Ticket limits and reopen history survive restarts. Creation is serialized across members to prevent quota races. The bot also refuses new tickets when the server has at least 490 channels or the parent category has at least 49 children. Archived channels continue consuming Discord's capacity; staff must clean them up. Limits intentionally reject or suppress work instead of queueing an unlimited backlog. Adjust them cautiously after measurement.
